@@ -8,17 +8,36 @@ The web dashboard is an open-source (Apache 2.0) browser-based control plane for
 
 ## Running the Dashboard
 
-**Full stack (Docker):**
+**End users:**
 ```bash
-make web
+decepticon                    # starts the core stack + drops into the terminal CLI
 ```
-Starts PostgreSQL, Neo4j, LangGraph, LiteLLM, and the web server. Open `http://localhost:3000`.
 
-**Local dev server** (requires services already running):
+The dashboard is **dynamic-spawn** (v1.1.8+): it does NOT come up on `decepticon start`. Bring it up from inside the CLI with the `/web` slash command, then open <http://localhost:3000>:
+
+| CLI command | Effect |
+|---|---|
+| `/web` (or `/web up`) | `docker compose --profile web up -d web` against the host daemon |
+| `/web down` (or `/web stop`) | stops the container; preserves it so the next `/web up` is fast |
+| `/web url` | prints `http://localhost:${WEB_PORT}` without touching docker |
+| `/dashboard` | alias for `/web` |
+
+Headless operators (no CLI, e.g. CI) can drive the same lifecycle from the host shell:
+```bash
+docker compose -p decepticon --profile web up -d --no-build web
+```
+
+**Contributors (full stack with hot-reload):**
+```bash
+make dev
+```
+Builds and starts every service with source-sync hot-reload. The web service still requires the `web` profile to be active — e.g. `COMPOSE_PROFILES=web make dev` — or bring it up after the fact with `/web up`. Open <http://localhost:3000>.
+
+**Contributors (local Next.js dev server):**
 ```bash
 make web-dev
 ```
-Starts only the Next.js dev server with hot-reload. Assumes the database and LangGraph are reachable.
+Runs the Next.js dev server locally on the host while infra (postgres, neo4j, litellm, langgraph, sandbox) stays in Docker. Faster web iteration than `make dev`.
 
 ---
 
@@ -59,7 +78,7 @@ Interactive visualization of the Neo4j knowledge graph:
 - Color-coded by node type (Host, Service, Vulnerability, Credential)
 - Live — updates as the agent adds nodes and edges
 
-Powered by [React Flow](https://reactflow.dev/) with Three.js for 3D rendering.
+Powered by [React Flow](https://reactflow.dev/) with `d3-force` for graph layout.
 
 ### OPPLAN Tracker
 
@@ -68,27 +87,6 @@ Per-objective progress board:
 - MITRE ATT&CK technique IDs per objective
 - OPSEC level indicator
 - Dependency graph (which objectives must complete before this one starts)
-
----
-
-## OSS vs EE Mode
-
-| Feature | OSS | EE |
-|---------|-----|----|
-| Authentication | None (single local user) | Multi-user + RBAC |
-| Engagement management | Single engagement | Multiple concurrent engagements |
-| User management | — | User roles and permissions |
-| Audit logging | — | Full audit trail |
-
-**OSS mode** (default): No login required. All data belongs to a single `local` user. Suitable for individual operators and self-hosted deployments.
-
-**EE mode** (Enterprise Edition): Links the private `@decepticon/ee` package. Requires a separate license.
-
-```bash
-make web-ee    # Switch to EE mode (links @decepticon/ee)
-make web-oss   # Switch back to OSS mode
-make web       # Restart after switching
-```
 
 ---
 
@@ -103,10 +101,11 @@ make web-migrate
 
 **Regenerate Prisma client** (after editing `prisma/schema.prisma`):
 ```bash
-make web-generate
+cd clients/web && npx prisma generate
 ```
+Or run `make web-build` to regenerate the client and build the dashboard in one step.
 
-Schema is at `clients/web/prisma/schema.prisma`. Key models: `User`, `Engagement`, `Finding`, `Objective`, `DefenseAction`.
+Schema is at `clients/web/prisma/schema.prisma`. Key model: `Engagement`.
 
 ---
 

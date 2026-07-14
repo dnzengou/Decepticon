@@ -13,6 +13,8 @@ interface PromptProps {
   onSubmit: (input: string) => void;
   /** Currently active agent name, e.g. "recon". null when idle. */
   activeAgent?: string | null;
+  /** Persistent assistant id ("soundwave" | "decepticon") — shown when no subagent is streaming. */
+  assistantId?: string;
   /** Queued message waiting to be sent after stream completes. */
   queuedMessage?: string | null;
   /** Callback to update the queued message (for editing). */
@@ -21,16 +23,22 @@ interface PromptProps {
 
 const DEBOUNCE_MS = 150;
 
-/** Compact status line: [Decepticon#1.0.0 | ActiveAgent] */
+/** Compact status line: [Decepticon#1.0.0 | ActiveAgent].
+ *
+ * Shows the streaming subagent (red, blinking) when one is active, otherwise
+ * falls back to the persistent assistant id (Soundwave / Decepticon).
+ */
 const StatusLine = React.memo(function StatusLine({
   activeAgent,
+  assistantId,
 }: {
   activeAgent: string | null;
+  assistantId: string;
 }) {
   const { tick } = useSpinnerFrame(activeAgent != null);
-  // Blink cycle: bright for 8 ticks, dim for 4 ticks (only when active)
   const bright = activeAgent == null || (tick % 12) < 8;
-  const label = labelForAgent(activeAgent);
+  const displayed = activeAgent ?? assistantId;
+  const label = labelForAgent(displayed);
 
   return (
     <Text>
@@ -42,7 +50,7 @@ const StatusLine = React.memo(function StatusLine({
           {label}
         </Text>
       ) : (
-        <Text dimColor>{label}</Text>
+        <Text color="#ef4444">{label}</Text>
       )}
       <Text dimColor>{"]"}</Text>
     </Text>
@@ -80,6 +88,7 @@ export const Prompt = React.memo(function Prompt({
   runState,
   onSubmit,
   activeAgent = null,
+  assistantId = "decepticon",
   queuedMessage = null,
   onEditQueue,
 }: PromptProps) {
@@ -115,12 +124,7 @@ export const Prompt = React.memo(function Prompt({
 
   // Reorder suggestions so selected dropdown item is first
   const suggestionList = showMenu
-    ? [
-        filteredCommands[selectedIdx]?.cmd,
-        ...commandEntries.map((c) => c.cmd).filter(
-          (c) => c !== filteredCommands[selectedIdx]?.cmd,
-        ),
-      ].filter((c): c is string => c != null)
+    ? filteredCommands.map((c) => c.cmd)
     : commandEntries.map((c) => c.cmd);
 
   // Reset selection on input change
@@ -222,7 +226,7 @@ export const Prompt = React.memo(function Prompt({
       )}
 
       {/* Compact status line — always visible */}
-      <StatusLine activeAgent={activeAgent} />
+      <StatusLine activeAgent={activeAgent} assistantId={assistantId} />
 
       {/* Context-sensitive keybinding hints */}
       <KeybindingHints runState={runState} hasQueue={queuedMessage != null} />

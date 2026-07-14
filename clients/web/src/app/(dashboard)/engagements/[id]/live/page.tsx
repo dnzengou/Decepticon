@@ -1,12 +1,15 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState } from "react";
 import { useParams } from "next/navigation";
 import type { AgentConfig } from "@/lib/agents";
 import { AgentGraphCanvas } from "@/components/agents/agent-graph-canvas";
-import { WebTerminal } from "@/components/terminal/web-terminal";
-import { useRunObserver } from "@/hooks/useRunObserver";
+import { useEngagementContext } from "@/lib/engagement-context";
 import { useAgents } from "@/hooks/useAgents";
+import { LiveActivityFeed } from "@/components/streaming/live-activity-feed";
+import { OpplanLiveOverlay } from "@/components/streaming/opplan-live-overlay";
+import { AgentDetailPanel } from "@/components/streaming/agent-detail-panel";
+import { ApprovalGate } from "@/components/streaming/approval-gate";
 
 export default function LivePage() {
   const params = useParams();
@@ -14,14 +17,10 @@ export default function LivePage() {
 
   const { agents } = useAgents();
   const [selectedAgent, setSelectedAgent] = useState<AgentConfig | null>(null);
-  const [threadId, setThreadId] = useState<string | null>(null);
 
-  const { events } = useRunObserver({ threadId });
-
-  const handleThreadId = useCallback((tid: string) => {
-    console.log("[LivePage] Thread ID received:", tid);
-    setThreadId(tid);
-  }, []);
+  // Observer + terminal are managed by the engagement layout — they persist
+  // across tab switches so events and PTY connection survive navigation.
+  const { events } = useEngagementContext();
 
   function handleAgentClick(agent: AgentConfig) {
     setSelectedAgent(
@@ -31,25 +30,39 @@ export default function LivePage() {
 
   return (
     <div className="flex h-full overflow-hidden">
-      {/* Left: Agent Execution Graph */}
-      <div className="w-1/2 overflow-hidden border-r border-white/[0.08]">
+      {/* Left: Activity Feed */}
+      <div className="relative w-1/4 min-w-[280px] overflow-hidden border-r border-white/[0.08]">
+        <LiveActivityFeed events={events} engagementId={engagementId} />
+        {selectedAgent && (
+          <div className="absolute inset-0 z-20">
+            <AgentDetailPanel
+              agent={selectedAgent}
+              events={events}
+              onClose={() => setSelectedAgent(null)}
+            />
+          </div>
+        )}
+      </div>
+
+      {/* Center: Agent Execution Graph + OPPLAN overlay */}
+      <div className="relative flex-1 min-w-[400px] overflow-hidden">
         <AgentGraphCanvas
           agents={agents}
           events={events}
           selectedAgent={selectedAgent}
           onAgentClick={handleAgentClick}
         />
+        <div className="absolute right-4 top-4 z-10">
+          <OpplanLiveOverlay engagementId={engagementId} />
+        </div>
+        {/* HITL approval gates — surface prominently during a run */}
+        <div className="absolute left-4 top-4 z-30 w-[360px] max-w-[calc(100%-2rem)]">
+          <ApprovalGate engagementId={engagementId} />
+        </div>
       </div>
 
-      {/* Right: CLI Terminal */}
-      <div className="w-1/2 overflow-hidden">
-        <WebTerminal
-          engagementId={engagementId}
-          agentId="decepticon"
-          className="h-full"
-          onThreadId={handleThreadId}
-        />
-      </div>
+      {/* Right column (terminal) is rendered by the engagement layout.
+           It persists across tab switches — no more reset on navigation. */}
     </div>
   );
 }

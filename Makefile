@@ -1,58 +1,324 @@
-# Decepticon — Development & Operations
+# Decepticon — Pre-release Verification & Development
 #
-# Dev workflow:    make dev   (build + hot-reload via docker compose watch)
-# Production:     make start (build + start, same as open-source user experience)
-# Interactive CLI: make cli   (in a separate terminal)
+# Purpose: dogfood and validate the OSS release flow before tagging. Every
+# Docker target builds from the local checkout (never pulls from GHCR), so
+# what you test is exactly what ships.
 #
-# Both dev and prod run identical Docker containers.
-# The only difference: `watch` syncs local source changes into containers.
+# Common workflows:
+#   make dogfood      Full OSS UX (launcher → onboard → CLI) on local code
+#   make smoke        Compose-only smoke (no launcher) — fast pre-release check
+#   make quality      PR gate (Python + CLI + Web)
+#   make dev          Backend hot-reload (compose watch) — daily dev loop
+#   make help         List all targets
 
 COMPOSE       := docker compose
-COMPOSE_WATCH := docker compose -f docker-compose.yml -f docker-compose.watch.yml
-COMPOSE_CLI   := $(COMPOSE) --profile cli
+# Dev override is now opt-in via an explicit ``-f`` chain — the file was
+# renamed from ``docker-compose.override.yml`` to ``docker-compose.dev.yml``
+# so it no longer auto-merges into every ``docker compose`` invocation.
+# The launcher-driven OSS stack uses ``$(COMPOSE)`` (base only); local-dev
+# targets that need the skills bind mount + workspace overlays chain
+# ``$(COMPOSE_DEV)``. Closes #214.
+COMPOSE_DEV   := docker compose -f docker-compose.yml -f docker-compose.dev.yml
+COMPOSE_WATCH := docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.watch.yml
+PROFILES_ALL  := --profile cli --profile c2-sliver
+WEB_DIR       := clients/web
 
-# Ensure DECEPTICON_HOME is always set so Docker Compose bind mounts resolve
-# correctly. Docker Compose cannot expand ~ in default values, so we must
-# expand it here via Make's $(HOME) before passing it to the compose process.
+# Dogfood: isolated $DECEPTICON_HOME so the launcher can onboard, write .env,
+# and stand up the stack without touching the user's real ~/.decepticon. The
+# launcher resolves all relative paths against the compose file's directory,
+# so docker-compose.yml + config/ + containers/ + .env.example are symlinked
+# back to the repo. workspace/ stays a real directory (engagement bind mount).
+DOGFOOD_HOME  := $(CURDIR)/.dogfood
+LAUNCHER_BIN  := clients/launcher/bin/decepticon
+
+# docker compose cannot expand ~ inside compose-file defaults, so resolve it
+# here before any subprocess inherits the env.
 export DECEPTICON_HOME ?= $(HOME)/.decepticon
 
-.PHONY: dev start cli cli-dev web web-dev infra web-db-ensure web-build web-lint web-migrate web-ee web-oss \
-        stop status logs health smoke build \
-        test test-local lint lint-fix quality-cli quality \
-        clean demo victims help
+# Mirror the launcher's start.go credential mount logic so `make dev` (and any
+# other target that calls `docker compose`) populates the litellm container's
+# Claude Code + Codex CLI OAuth tokens without requiring users to run
+# `decepticon onboard`. Existence check at make-time: real file when host has
+# tokens, /dev/null otherwise so docker doesn't synthesize a bind directory.
+export CLAUDE_CREDENTIALS_VOLUME ?= $(shell test -f $(HOME)/.claude/.credentials.json && echo $(HOME)/.claude/.credentials.json || echo /dev/null)
+export CODEX_AUTH_VOLUME ?= $(shell test -f $(HOME)/.codex/auth.json && echo $(HOME)/.codex/auth.json || echo /dev/null)
 
-# ── Development ──────────────────────────────────────────────────
+.PHONY: help \
+        dogfood launcher smoke \
+        dev cli-dev web-dev infra \
+        quality quality-strict quality-cli test test-local lint lint-fix \
+        ci-lint ci-test ci-test-coverage ci-test-coverage-report \
+        web-build web-hotswap web-lint web-migrate \
+        status logs health clean \
+        node-install web-db-ensure \
+        benchmark recreate-litellm
 
-## Build images and start with hot-reload (source changes auto-sync)
+# ── Help (default target) ────────────────────────────────────────
+
+help:
+	@echo "Decepticon — Pre-release Verification & Development"
+	@echo ""
+	@echo "Pre-release verification (release readiness):"
+	@echo "  make dogfood      Full OSS UX (launcher → onboard → CLI) on local code"
+	@echo "  make smoke        Compose-only smoke (no launcher) — fast OSS-shape check"
+	@echo "  make launcher     Build the Go launcher binary ($(LAUNCHER_BIN))"
+	@echo ""
+	@echo "Development (build the thing being released):"
+	@echo "  make dev          Backend hot-reload (compose watch)"
+	@echo "  make cli-dev      CLI locally + backend hot-reload"
+	@echo "  make web-dev      Web (Next.js) locally + backend hot-reload"
+	@echo ""
+	@echo "Quality gates (PR readiness):"
+	@echo "  make quality        PR gate — mirrors CI PR lane (fast, no slow tests, errors-only typecheck)"
+	@echo "  make quality-strict Release gate — mirrors CI main-push lane + full basedpyright warning audit"
+	@echo "  make ci-lint        Lint + format + basedpyright errors-only (CI mirror)"
+	@echo "  make ci-test        pytest fast lane (-n auto -m \"not slow\", no coverage)"
+	@echo "  make ci-test-coverage  pytest with coverage gate (--cov-fail-under=60)"
+	@echo "  make ci-test-coverage-report  pytest fast lane with coverage report (no gate, PR-informational)"
+	@echo "  make test           pytest in container"
+	@echo "  make test-local     pytest locally (uv sync --dev; takes ARGS=)"
+	@echo "  make lint           Python lint + format check + basedpyright (all levels, local exploratory)"
+	@echo "  make lint-fix       Auto-fix Python lint + format"
+	@echo ""
+	@echo "Web dashboard (single checks):"
+	@echo "  make web-build    Prisma generate + Next build"
+	@echo "  make web-hotswap  Build + inject into running container (~15s)"
+	@echo "  make web-lint     ESLint"
+	@echo "  make web-migrate [NAME=]   Prisma migrate dev"
+	@echo ""
+	@echo "Ops:"
+	@echo "  make status       docker compose ps"
+	@echo "  make logs [SVC=]  Follow logs (default: langgraph)"
+	@echo "  make health       KG + Neo4j + Web health checks"
+	@echo "  make clean        Full teardown (compose volumes + .dogfood/)"
+	@echo ""
+	@echo "Other:"
+	@echo "  make benchmark [ARGS=\"--level 1\"]"
+
+# ── Pre-release Verification (PRIMARY) ───────────────────────────
+
+## End-to-end OSS dogfood: launcher onboard → engagement picker → compose up
+## → CLI. Identical UX to a real `curl | bash` install, but every image and
+## the launcher itself come from the current checkout (tag :dev). The
+## launcher version is "dev" so auto-update + config-sync are skipped — the
+## symlinked .dogfood/ tree is the source of truth.
+dogfood: launcher
+	@echo "[dogfood] Stopping any prior repo-root stack to avoid container-name conflict..."
+	@$(COMPOSE) $(PROFILES_ALL) down --remove-orphans 2>/dev/null; true
+	@mkdir -p $(DOGFOOD_HOME)/workspace
+	@ln -sfn $(CURDIR)/docker-compose.yml $(DOGFOOD_HOME)/docker-compose.yml
+	@ln -sfn $(CURDIR)/config              $(DOGFOOD_HOME)/config
+	@ln -sfn $(CURDIR)/containers          $(DOGFOOD_HOME)/containers
+	@ln -sfn $(CURDIR)/.env.example        $(DOGFOOD_HOME)/.env.example
+	@echo ""
+	@echo "[dogfood] Building images from local code (tag :dev)..."
+	DECEPTICON_VERSION=dev $(COMPOSE) --profile cli build
+	@echo ""
+	@echo "[dogfood] Launching ./$(LAUNCHER_BIN) (DECEPTICON_HOME=$(DOGFOOD_HOME))"
+	@echo ""
+	DECEPTICON_VERSION=dev DECEPTICON_HOME=$(DOGFOOD_HOME) ./$(LAUNCHER_BIN)
+
+## Build the Go launcher binary (version=dev, gates auto-update + config sync).
+launcher:
+	cd clients/launcher && go build \
+		-ldflags '-X github.com/PurpleAILAB/Decepticon/clients/launcher/cmd.version=dev' \
+		-o bin/decepticon
+
+## Compose-only smoke (no launcher, no onboard wizard) — fastest possible
+## release-shape check. Replicates only the launcher's compose Up step:
+##   1. Down + purge volumes (parity with `decepticon remove`)
+##   2. Build all images from local code (replaces `compose pull` from GHCR)
+##   3. up -d --no-build --wait --wait-timeout  (identical to launcher Up)
+##   4. Health checks (identical to `decepticon health`)
+## Use dogfood for the full release flow; use smoke when the compose stack
+## is the only thing you've changed.
+smoke:
+	@echo "=== Decepticon pre-release smoke (compose-only, no launcher) ==="
+	@echo ""
+	@echo "[1/4] Clean state (purging containers + volumes)..."
+	@$(COMPOSE) $(PROFILES_ALL) down --volumes --remove-orphans 2>/dev/null; true
+	@echo ""
+	@echo "[2/4] Building images from local code..."
+	$(COMPOSE) --profile cli build
+	@echo ""
+	@echo "[3/4] Starting services (--no-build --wait, OSS launcher flow)..."
+	$(COMPOSE) --profile cli up -d --no-build --wait \
+		--wait-timeout $${DECEPTICON_STARTUP_TIMEOUT_SECONDS:-600}
+	@echo ""
+	@echo "[4/4] Health checks..."
+	@$(MAKE) -s health
+	@echo ""
+	@echo "=== smoke OK — stack mirrors OSS user state ==="
+	@echo "  Web:          http://localhost:$${WEB_PORT:-3000}"
+	@echo "  LangGraph:    http://localhost:$${LANGGRAPH_PORT:-2024}"
+	@echo "  Run dogfood:  make dogfood"
+	@echo "  Teardown:     make clean"
+
+# ── Development (build the thing being released) ─────────────────
+
+## Build images and start with hot-reload (source changes auto-sync).
 dev:
 	$(COMPOSE_WATCH) watch
 
-## Run interactive CLI in Docker (prod-like, requires `make dev` for backend)
-cli:
-	$(COMPOSE_CLI) run --rm cli
-
-## Run interactive CLI locally (dev mode — starts backend with hot-reload, then local CLI)
+## CLI locally (Node) — backend stays in Docker with hot-reload sync.
+##
+## Build chain: shared/streaming dist → cli dist → run.
+## `npm run dev` only watches tsc; `node --watch` re-execs on dist changes.
+## Both watchers run as background jobs; `wait` keeps the target alive so
+## Ctrl-C tears both down cleanly.
 cli-dev: infra
 	@$(COMPOSE_WATCH) watch --no-up --quiet langgraph &
-	cd clients/cli && DECEPTICON_API_URL=$${DECEPTICON_API_URL:-http://localhost:2024} npm run dev
+	npm run build --workspace=@decepticon/streaming
+	cd clients/cli && npm run build
+	cd clients/cli && (npm run dev & DECEPTICON_API_URL=$${DECEPTICON_API_URL:-http://localhost:2024} node --watch dist/index.js & wait)
 
-# ── Production-like ──────────────────────────────────────────────
+## Next.js dev server locally — infra stays in Docker with hot-reload.
+web-dev: infra web-db-ensure node-install
+	# Build streaming first: both the Next dev server and the PTY-spawned CLI
+	# import @decepticon/streaming, which resolves to its dist/ build.
+	npm run build --workspace=@decepticon/streaming
+	@$(COMPOSE_WATCH) watch --no-up --quiet langgraph &
+	@echo "[web-dev] Starting terminal server (ws://localhost:3003)..."
+	@cd $(WEB_DIR) && npx tsx server/terminal-server.ts &
+	@echo "[web-dev] Starting Next.js dev server (http://localhost:3000)..."
+	cd $(WEB_DIR) && npm run dev
 
-## Build and start all services in background (same as open-source user)
-start:
-	$(COMPOSE) up -d --build
+# Internal: bring up backend infra (built from local code).
+# Chains the dev override so local-dev workflows (cli-dev, web-dev) pick up
+# the skills bind mount alongside the base stack. The OSS launcher path
+# (smoke + dogfood) keeps ``$(COMPOSE)`` to mirror what end users run.
+infra:
+	@echo "[infra] Ensuring backend services are running..."
+	@$(COMPOSE_DEV) up -d --build postgres neo4j litellm langgraph sandbox
 
-## Stop all services
-stop:
-	$(COMPOSE) --profile cli --profile victims --profile c2-sliver down
+# ── Quality gates ────────────────────────────────────────────────
 
-## Show service status
+test:
+	$(COMPOSE) exec langgraph python -m pytest $(ARGS)
+
+test-local:
+	uv run pytest $(ARGS)
+
+lint:
+	uv run ruff check .
+	uv run ruff format --check .
+	uv run basedpyright
+
+lint-fix:
+	uv run ruff check --fix .
+	uv run ruff format .
+
+# ── CI mirror targets ─────────────────────────────────────────────
+# These are the exact commands CI runs. .github/workflows/ci.yml
+# dispatches via `make ci-lint` / `make ci-test{,-coverage}` so this
+# Makefile stays the single source of truth — no drift between local
+# and CI is possible by construction.
+
+ci-lint:
+	@echo "==> ruff check"
+	uv run ruff check .
+	@echo "==> ruff format --check"
+	uv run ruff format --check .
+	@echo "==> basedpyright (errors only — pre-existing warnings tracked but non-blocking)"
+	uv run basedpyright --outputjson > bp.json || true
+	uv run python scripts/check_basedpyright_errors.py bp.json
+
+## PR lane: fast, no coverage, slow tests excluded.
+ci-test:
+	uv run pytest -n auto -q -m "not slow"
+
+## SKILL.md schema validator (warn mode — Phase 0). Exit 0 even if violations found.
+.PHONY: audit-skills
+audit-skills:
+	uv run python -m decepticon.skill_audit --mode warn
+
+## SKILL.md schema validator (strict mode — post-Phase-0 CI gate). Exit 1 on any violation.
+.PHONY: audit-skills-strict
+audit-skills-strict:
+	uv run python -m decepticon.skill_audit --mode strict
+
+## Skill graph builder (Phase 1a) — compile SKILL.md + seeds + MITRE STIX
+## into packages/decepticon/decepticon/skills/.graph/skills.cypher.
+.PHONY: build-skill-graph
+build-skill-graph:
+	uv run python -m decepticon.skillogy.builder --frozen-built-at
+
+## CI gate — assert the checked-in skills.cypher matches what the
+## builder produces from the current SKILL.md + seed YAML + pinned STIX.
+.PHONY: check-skill-graph
+check-skill-graph:
+	uv run python -m decepticon.skillogy.builder --frozen-built-at --check
+
+## main-push lane: slow included, coverage 60% gate (ratcheted from 35% in #380).
+ci-test-coverage:
+	uv run pytest -n auto --cov --cov-report=xml --cov-report=term --cov-fail-under=60
+
+## PR-informational lane: coverage without any threshold, fast subset
+## (``-m "not slow"`` — matches the blocking PR ``ci-test`` lane so the
+## reported coverage % is for the same test set authors actually run on a
+## PR). Used by the non-blocking ``coverage-report`` job in ci.yml so PR
+## authors see a coverage delta without blocking merge (the documented
+## decision is to keep the blocking PR pytest step coverage-free — see
+## ci.yml comment).
+ci-test-coverage-report:
+	uv run pytest -n auto --cov --cov-report=xml --cov-report=term --cov-fail-under=0 -m "not slow"
+
+quality-cli: node-install
+	# streaming workspace must be built first — its package.json main
+	# resolves to dist/, which cli's typecheck + build consume.
+	npm run build --workspace=@decepticon/streaming
+	npm run typecheck --workspace=@decepticon/cli
+	npm run build --workspace=@decepticon/cli
+	npm run test --workspace=@decepticon/cli
+
+## PR gate — mirrors CI PR lane (errors-only typecheck + fast pytest + CLI + Web).
+## Use before opening a PR; passing this guarantees CI will pass.
+quality: ci-lint ci-test quality-cli web-lint web-build
+	@echo ""
+	@echo "OK — PR gates passed (mirrors CI PR lane)"
+
+## Release gate — mirrors CI main-push lane (coverage 60%) + full basedpyright
+## audit (warnings + info). Run before tagging a release.
+quality-strict: ci-lint ci-test-coverage quality-cli web-lint web-build
+	@echo ""
+	@echo "==> basedpyright (full — warning + info audit, non-blocking)"
+	uv run basedpyright
+	@echo ""
+	@echo "OK — release gate passed (mirrors CI main lane + warning audit)"
+
+# ── Web Dashboard (single checks) ────────────────────────────────
+# All web targets share the root `node-install` so workspace deps hoist
+# into the root node_modules — no separate clients/web/node_modules tree.
+
+web-build: node-install
+	# streaming workspace first — the web resolves @decepticon/streaming to its
+	# dist/ via package exports (no src path alias), so next build needs it.
+	npm run build --workspace=@decepticon/streaming
+	cd $(WEB_DIR) && npx prisma generate && npm run build
+
+## Hot-swap web dashboard into running container (~15s vs ~5min docker build).
+## Builds Next.js on host, injects via tar pipe, restarts container.
+web-hotswap: node-install web-build
+	./scripts/web-hotswap.sh --skip-build
+
+web-lint: node-install
+	cd $(WEB_DIR) && npx eslint src/ --max-warnings 0
+
+web-migrate: node-install
+	cd $(WEB_DIR) && npx prisma migrate dev --name $(or $(NAME),init)
+
+# ── Status / Logs / Health / Clean ───────────────────────────────
+
 status:
 	$(COMPOSE) ps
 
-## Run all health checks (KG backend + Neo4j + Web dashboard)
+## Follow logs (usage: make logs or make logs SVC=langgraph)
+logs:
+	$(COMPOSE) logs -f $(or $(SVC),langgraph)
+
+## Health checks: KG backend + Neo4j + Web (parity with `decepticon health`).
 health:
-	@$(COMPOSE) exec langgraph python -m decepticon.tools.research.health >/dev/null 2>&1 \
+	@$(COMPOSE) exec -T langgraph python -m decepticon.tools.research.health >/dev/null 2>&1 \
 		&& echo "kg:    OK" || (echo "kg:    FAIL" && exit 1)
 	@$(COMPOSE) exec -T neo4j cypher-shell -u neo4j -p "$${NEO4J_PASSWORD:-decepticon-graph}" "RETURN 1 AS ok;" >/dev/null 2>&1 \
 		&& echo "neo4j: OK" || (echo "neo4j: FAIL" && exit 1)
@@ -60,206 +326,52 @@ health:
 		&& echo "web:   OK (http://localhost:$${WEB_PORT:-3000})" \
 		|| (echo "web:   FAIL — not reachable on port $${WEB_PORT:-3000}" && exit 1)
 
-## Follow service logs (usage: make logs or make logs SVC=langgraph)
-logs:
-	$(COMPOSE) logs -f $(or $(SVC),langgraph)
+## Full teardown: containers + volumes + .dogfood/. Destructive — also
+## wipes the dogfood .env (API keys) so the next `make dogfood` starts
+## with a fresh onboard wizard.
+clean:
+	$(COMPOSE) $(PROFILES_ALL) down --volumes --remove-orphans
+	@rm -rf $(DOGFOOD_HOME)
+	@echo "OK — compose volumes purged, .dogfood/ removed"
 
-# ── Build ────────────────────────────────────────────────────────
+# ── Internal idempotent helpers ──────────────────────────────────
 
-## Build all Docker images without starting
-build:
-	$(COMPOSE) --profile cli build
-
-# ── Testing & Quality ────────────────────────────────────────────
-
-## Run pytest inside langgraph container
-test:
-	$(COMPOSE) exec langgraph python -m pytest $(ARGS)
-
-## Run tests locally (requires uv sync --dev)
-test-local:
-	uv run pytest $(ARGS)
-
-## Lint and typecheck Python locally
-lint:
-	uv run ruff check .
-	uv run ruff format --check .
-	uv run basedpyright
-
-## Auto-fix Python lint issues
-lint-fix:
-	uv run ruff check --fix .
-	uv run ruff format .
-
-# Internal: ensure root node_modules exist (idempotent)
 node-install:
 	@test -d node_modules || npm install
 
-## CLI quality gates: typecheck + build + test (mirrors CI)
-quality-cli: node-install
-	npm run typecheck --workspace=@decepticon/cli
-	npm run build --workspace=@decepticon/cli
-	npm run test --workspace=@decepticon/cli
-
-## Run every quality gate locally — Python + CLI + Web. Run before opening a PR.
-quality: lint test-local quality-cli web-lint web-build
-	@echo ""
-	@echo "OK — all quality gates passed (python + cli + web)"
-
-# ── Web Dashboard ───────────────────────────────────────────────
-
-## Start web dashboard (Docker, includes PostgreSQL + Neo4j)
-web:
-	$(COMPOSE) up -d --build web
-
-## Start web dashboard in dev mode (Next.js + terminal WebSocket server)
-## Automatically starts infra services with hot-reload, then local web.
-web-dev: infra web-db-ensure
-	@$(COMPOSE_WATCH) watch --no-up --quiet langgraph &
-	@echo "[web-dev] Starting terminal server (ws://localhost:3003)..."
-	@cd clients/web && npx tsx server/terminal-server.ts &
-	@echo "[web-dev] Starting Next.js dev server (http://localhost:3000)..."
-	cd clients/web && npm run dev
-
-# Internal: start infra services (postgres, neo4j, litellm, langgraph, sandbox)
-infra:
-	@echo "[infra] Ensuring backend services are running..."
-	@$(COMPOSE) up -d --build postgres neo4j litellm langgraph sandbox
-
-# Internal: ensure decepticon_web DB exists and migrations are applied
+# postgres-init/01-create-web-db.sql auto-creates decepticon_web on fresh
+# volumes. This target only waits for postgres readiness and applies
+# Prisma migrations.
 web-db-ensure:
 	@echo "[web-db-ensure] Waiting for PostgreSQL..."
 	@for i in 1 2 3 4 5 6 7 8 9 10; do \
-		docker exec decepticon-postgres pg_isready -U decepticon -q 2>/dev/null && break; \
+		docker exec decepticon$${DECEPTICON_STACK_NAME:+-$${DECEPTICON_STACK_NAME}}-postgres pg_isready -U decepticon -q 2>/dev/null && break; \
 		sleep 1; \
 	done
-	@docker exec decepticon-postgres psql -U decepticon -d postgres -tAc \
-		"SELECT 1 FROM pg_database WHERE datname='decepticon_web'" 2>/dev/null | grep -q 1 \
-		|| docker exec decepticon-postgres psql -U decepticon -d postgres -c "CREATE DATABASE decepticon_web;" >/dev/null
-	@cd clients/web && npx prisma migrate deploy 2>&1 | tail -1
+	@cd $(WEB_DIR) && npx prisma migrate deploy 2>&1 | tail -1
 
-# Internal: ensure web node_modules exist (idempotent)
-web-install:
-	@test -d clients/web/node_modules || npm install --prefix clients/web
+# ── Benchmark ────────────────────────────────────────────────────
 
-## Build web dashboard (generates Prisma client first)
-web-build: web-install
-	cd clients/web && npx prisma generate && npm run build
+## Force-recreate the litellm container so it captures the host's CURRENT
+## ~/.claude/.credentials.json inode. Workaround for the Docker single-file
+## bind-mount limitation: the container's view is pinned to the inode at
+## mount time; Claude Code CLI rotates credentials via atomic-rename which
+## allocates a new inode that the container never sees. Force-recreate
+## remounts and picks up the freshly written file. Intended to run as a
+## per-cycle preamble in the benchmark loop so each cycle starts with a
+## valid OAuth access token (token TTL ~8h ≫ cycle duration ~30m).
+recreate-litellm:
+	@$(COMPOSE) up -d --no-build --force-recreate litellm
+	@docker exec decepticon$${DECEPTICON_STACK_NAME:+-$${DECEPTICON_STACK_NAME}}-litellm sh -c 'test -s /root/.claude/.credentials.json' \
+		&& echo "recreate-litellm: creds mount OK" \
+		|| (echo "recreate-litellm: creds mount EMPTY — onboard first" && exit 1)
 
-## Lint web dashboard
-web-lint: web-install
-	cd clients/web && npx eslint src/ --max-warnings 0
+## Run benchmark suite (usage: make benchmark ARGS="--level 1")
+benchmark:
+	uv run python -m benchmark.runner $(ARGS)
 
-## Run Prisma migration (usage: make web-migrate or make web-migrate NAME=add_fields)
-web-migrate: web-install
-	cd clients/web && npx prisma migrate dev --name $(or $(NAME),init)
-
-## Link EE package for SaaS development
-web-ee:
-	cd clients/ee && npm link
-	cd clients/web && npm link @decepticon/ee
-	@grep -q 'NEXT_PUBLIC_DECEPTICON_EDITION' clients/web/.env 2>/dev/null \
-		&& sed -i 's/NEXT_PUBLIC_DECEPTICON_EDITION=.*/NEXT_PUBLIC_DECEPTICON_EDITION=ee/' clients/web/.env \
-		|| echo 'NEXT_PUBLIC_DECEPTICON_EDITION=ee' >> clients/web/.env
-	@echo "EE linked — restart web-dev for SaaS mode"
-
-## Unlink EE package (switch to OSS mode)
-web-oss:
-	cd clients/web && npm unlink @decepticon/ee 2>/dev/null; true
-	@sed -i '/NEXT_PUBLIC_DECEPTICON_EDITION/d' clients/web/.env 2>/dev/null; true
-	@echo "EE unlinked — restart web-dev for OSS mode"
-
-# ── OSS Smoke Test ──────────────────────────────────────────────
-
-## End-to-end OSS user simulation: clean slate → build → start → health checks.
-## Replicates exactly what an open-source user experiences on first run.
-smoke:
-	@echo "=== Decepticon OSS smoke test ==="
-	@echo ""
-	@echo "[1/4] Clean state (removing all containers + volumes)..."
-	@$(COMPOSE) --profile cli --profile victims --profile c2-sliver down --volumes --remove-orphans 2>/dev/null; true
-	@echo ""
-	@echo "[2/4] Building and starting all services (docker compose up -d --build)..."
-	$(COMPOSE) up -d --build
-	@echo ""
-	@echo "[3/4] Waiting for services to become healthy..."
-	@echo -n "  LangGraph: "
-	@until curl -sf http://localhost:$${LANGGRAPH_PORT:-2024}/ok >/dev/null 2>&1; do printf '.'; sleep 3; done && echo " OK"
-	@echo -n "  Neo4j:     "
-	@until $(COMPOSE) exec -T neo4j cypher-shell -u neo4j -p "$${NEO4J_PASSWORD:-decepticon-graph}" "RETURN 1 AS ok;" >/dev/null 2>&1; do printf '.'; sleep 3; done && echo " OK"
-	@echo -n "  Web:       "
-	@until curl -sf http://localhost:$${WEB_PORT:-3000} >/dev/null 2>&1; do printf '.'; sleep 3; done && echo " OK"
-	@echo ""
-	@echo "[4/4] Running health checks..."
-	@$(MAKE) health
-	@echo ""
-	@echo "=== Smoke test PASSED — stack is healthy ==="
-	@echo ""
-	@echo "  Web dashboard:  http://localhost:$${WEB_PORT:-3000}"
-	@echo "  LangGraph API:  http://localhost:$${LANGGRAPH_PORT:-2024}"
-	@echo "  Run CLI:        make cli"
-	@echo ""
-	@echo "To tear down: make clean"
-
-# ── Victim Targets (demo/testing) ───────────────────────────────
-
-## Start vulnerable test targets (DVWA + Metasploitable 2)
-victims:
-	$(COMPOSE) --profile victims up -d
-
-## Run guided demo (Metasploitable 2)
-demo:
-	$(COMPOSE) --profile victims up -d
-	@echo "Waiting for services..."
-	@until curl -sf http://localhost:$${LANGGRAPH_PORT:-2024}/ok >/dev/null 2>&1; do sleep 2; done
-	$(COMPOSE_CLI) run --rm -e DECEPTICON_INITIAL_MESSAGE="Resume the demo engagement and execute all objectives." cli
-
-# ── Cleanup ──────────────────────────────────────────────────────
-
-## Stop services and remove volumes
-clean:
-	$(COMPOSE) --profile cli --profile victims --profile c2-sliver down --volumes --remove-orphans
-
-# ── Help ─────────────────────────────────────────────────────────
-
-## Show this help
-help:
-	@echo "Decepticon — Development & Operations"
-	@echo ""
-	@echo "Development:"
-	@echo "  make dev          Build + start with hot-reload (docker compose watch)"
-	@echo "  make cli          Run interactive CLI in Docker"
-	@echo "  make cli-dev      Run interactive CLI locally (hot-reload)"
-	@echo ""
-	@echo "Production:"
-	@echo "  make start        Build + start all services"
-	@echo "  make stop         Stop all services"
-	@echo "  make status       Show service status"
-	@echo "  make health       Run all health checks (KG + Neo4j + Web)"
-	@echo "  make logs         Follow logs (SVC=langgraph)"
-	@echo ""
-	@echo "OSS Release Testing:"
-	@echo "  make smoke        Full OSS user simulation (clean → build → health checks)"
-	@echo ""
-	@echo "Quality:"
-	@echo "  make quality      Run all quality gates (Python + CLI + Web) — run before PR"
-	@echo "  make test         Run pytest in container"
-	@echo "  make test-local   Run pytest locally"
-	@echo "  make lint         Python lint + typecheck"
-	@echo "  make lint-fix     Auto-fix Python lint"
-	@echo "  make quality-cli  CLI typecheck + build + test"
-	@echo "  make web-lint     Web ESLint"
-	@echo "  make web-build    Build web dashboard"
-	@echo ""
-	@echo "Web Dashboard:"
-	@echo "  make web          Start web (Docker)"
-	@echo "  make web-dev      Local Next.js dev server"
-	@echo "  make web-migrate  Run Prisma migration (NAME=migration_name)"
-	@echo "  make web-ee       Link EE package (SaaS mode)"
-	@echo "  make web-oss      Unlink EE package (OSS mode)"
-	@echo ""
-	@echo "Other:"
-	@echo "  make build        Build all Docker images"
-	@echo "  make victims      Start vulnerable targets (DVWA + Metasploitable 2)"
-	@echo "  make demo         Run guided demo"
-	@echo "  make clean        Stop + remove volumes"
+## CVE-Bench offline dry run (mocked LLM + sandbox, 3 fixtures, seed=0).
+## Output: benchmark/results/cve-bench/dry-run-<YYYY-MM-DD>.jsonl
+cve-bench-dry:
+	CVE_BENCH_DRY_RUN_SEED=0 PYTHONHASHSEED=0 \
+		uv run python -m benchmark.cve_bench.dry_run $(ARGS)
